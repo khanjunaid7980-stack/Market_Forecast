@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+html, body, #root { height: 100%; }
+body { font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace; }
+
+.panel { @apply bg-term-panel border border-term-border rounded-sm; }
+.label { @apply text-[11px] uppercase tracking-widest text-term-muted; }
+.kv { @apply flex justify-between gap-3 text-sm; }
+.num { @apply font-mono tabular-nums; }
+.amber { color: #ffb000; }
+.cyan  { color: #27e0c5; }
+.green { color: #3ddc84; }
+.red   { color: #ff5757; }
+
+input.term {
+  @apply bg-term-bg border border-term-border rounded-sm px-2 py-1 text-sm text-term-fg outline-none;
+}
+input.term:focus { @apply border-term-amber; }
