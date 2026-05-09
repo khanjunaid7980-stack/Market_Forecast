@@ -1,17 +1,18 @@
-"""Market data via yfinance — free, no API key required.
+"""Live market data via yfinance.
 
-Pulls fundamentals, computes multi-year growth histories,
-normalises FCF (TTM + 3-year average) and applies multiple
-fallbacks so the tool works even when yfinance is partially
-rate-limited.
+EDGAR (modules/edgar.py) is the primary fundamentals source.
+This module is a thin wrapper around yfinance for the bits SEC doesn't serve:
+live price, market cap, beta, sector tags, forward multiples, and — when
+available — the analyst 5-year growth consensus.
 """
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
+
+import numpy as np
+import pandas as pd
 
 try:
     import yfinance as yf
@@ -19,342 +20,118 @@ except ImportError:
     yf = None  # type: ignore[assignment]
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
+@dataclass
+class MarketSnapshot:
+    ticker: str
+    price: float | None = None
+    market_cap: float | None = None
+    shares_outstanding: float | None = None
+    beta: float | None = None
+    forward_pe: float | None = None
+    trailing_pe: float | None = None
+    peg: float | None = None
+    sector: str | None = None
+    industry: str | None = None
+    long_name: str | None = None
+    currency: str = "USD"
+    analyst_growth_5y: float | None = None  # decimal
 
-def _yoy(arr: list[float]) -> list[float]:
-    """YoY growth rates from a chronologically-ordered (oldest-first) series."""
-    out: list[float] = []
-    for i in range(1, len(arr)):
-        prev, curr = arr[i - 1], arr[i]
-        if prev and abs(prev) > 1e-9 and np.isfinite(prev) and np.isfinite(curr):
-            out.append((curr - prev) / abs(prev))
-    return out
+    @property
+    def is_valid(self) -> bool:
+        return self.price is not None or self.market_cap is not None
 
 
-def _first(*vals: Any) -> Any:
-    """Return the first value that is not None and not NaN."""
-    for v in vals:
+def _g(info: dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        v = info.get(k)
         if v is not None:
             try:
-                if v == v:  # NaN check
+                if v == v:
                     return v
             except Exception:
                 return v
     return None
 
 
-def _series_recent(df: pd.DataFrame, *keys: str, n: int = 5) -> list[float]:
-    """Return last n values (oldest→newest) from the first matching row in df."""
-    for k in keys:
-        if k in df.index:
-            s = df.loc[k].sort_index().dropna()
-            vals = [float(v) for v in s.values if np.isfinite(float(v))]
-            return vals[-n:]
-    return []
-
-
-# ---------------------------------------------------------------------------
-# data model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Snapshot:
-    ticker: str
-    name: str = ""
-    price: float | None = None
-    market_cap: float | None = None
-    shares: float | None = None
-
-    # Balance-sheet items
-    total_debt: float = 0.0
-    total_cash: float = 0.0
-    net_debt: float = 0.0           # total_debt - total_cash
-
-    # Income / cash flow
-    fcf_ttm: float | None = None    # TTM free cash flow
-    fcf_3y_avg: float | None = None # 3-year average FCF (normalised)
-    revenue_ttm: float | None = None
-    ebit_ttm: float | None = None
-    eps_ttm: float | None = None
-    operating_margin: float | None = None
-    gross_margin: float | None = None
-    da_ttm: float | None = None     # D&A TTM
-    capex_ttm: float | None = None  # CapEx TTM (positive = outflow)
-
-    # Market multiples
-    pe_ttm: float | None = None
-    forward_pe: float | None = None
-    peg: float | None = None
-
-    # Risk / cost of capital
-    beta: float | None = None
-    cost_of_debt: float | None = None  # estimated from interest / debt
-
-    # Growth intelligence
-    analyst_growth_5y: float | None = None   # consensus decimal
-    rev_growth_history: list[float] = field(default_factory=list)   # YoY decimals
-    eps_growth_history: list[float] = field(default_factory=list)
-    fcf_history: list[float] = field(default_factory=list)           # absolute, oldest first
-    rev_history: list[float] = field(default_factory=list)           # absolute, oldest first
-
-    # Return metrics
-    roe: float | None = None
-    roa: float | None = None
-    roic: float | None = None
-
-    # Meta
-    sector: str | None = None
-    industry: str | None = None
-    currency: str = "USD"
-    data_quality: str = "OK"   # OK | PARTIAL | ERROR
-
-    @property
-    def enterprise_value(self) -> float | None:
-        """Simple EV = market cap + net debt."""
-        if self.market_cap is None:
-            return None
-        return self.market_cap + self.net_debt
-
-    @property
-    def fcf_base(self) -> float | None:
-        """Best FCF base for DCF: 3y-avg if available, else TTM."""
-        if self.fcf_3y_avg and abs(self.fcf_3y_avg) > 1e4:
-            return self.fcf_3y_avg
-        return self.fcf_ttm
-
-
-# ---------------------------------------------------------------------------
-# primary fetcher
-# ---------------------------------------------------------------------------
-
-@lru_cache(maxsize=256)
-def fetch_snapshot(ticker: str) -> Snapshot:
-    snap = Snapshot(ticker=ticker.upper())
+@lru_cache(maxsize=128)
+def fetch_market_snapshot(ticker: str) -> MarketSnapshot:
+    snap = MarketSnapshot(ticker=ticker.upper())
     if yf is None:
-        snap.data_quality = "ERROR"
         return snap
-
-    tk = yf.Ticker(ticker)
-
-    # --- 1. info dict (rich but sometimes flaky) ---
-    info: dict[str, Any] = {}
     try:
-        info = tk.info or {}
-    except Exception:
-        info = {}
-
-    # --- 2. fast_info as a complement ---
-    fast: dict[str, Any] = {}
-    try:
-        fi = tk.fast_info
-        for attr in ("last_price", "market_cap", "shares", "currency"):
-            try:
-                v = getattr(fi, attr, None)
-                if v is not None:
-                    fast[attr] = v
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    def g(*keys: str) -> Any:
-        return _first(*(info.get(k) for k in keys))
-
-    # --- 3. scalar fields from info ---
-    snap.name = _first(g("longName", "shortName"), ticker.upper())
-    snap.price = _first(
-        g("currentPrice", "regularMarketPrice", "previousClose"),
-        fast.get("last_price"),
-    )
-    snap.market_cap = _first(g("marketCap"), fast.get("market_cap"))
-    snap.shares = _first(
-        g("sharesOutstanding", "impliedSharesOutstanding"),
-        fast.get("shares"),
-    )
-    snap.currency = _first(g("currency", "financialCurrency"), fast.get("currency"), "USD")
-    snap.beta = g("beta", "beta3Year")
-    snap.sector = g("sector")
-    snap.industry = g("industry")
-    snap.pe_ttm = g("trailingPE")
-    snap.forward_pe = g("forwardPE")
-    snap.peg = g("pegRatio")
-    snap.eps_ttm = g("trailingEps")
-    snap.operating_margin = g("operatingMargins")
-    snap.gross_margin = g("grossMargins")
-    snap.roe = g("returnOnEquity")
-    snap.roa = g("returnOnAssets")
-    snap.fcf_ttm = g("freeCashflow")
-    snap.revenue_ttm = g("totalRevenue", "revenue")
-    snap.da_ttm = g("depreciation", "depreciationAndAmortization")
-    snap.ebit_ttm = g("ebit", "operatingIncome")
-
-    # debt / cash — multiple fallback keys
-    snap.total_debt = float(_first(g("totalDebt"), 0) or 0)
-    snap.total_cash = float(_first(g("totalCash"), 0) or 0)
-    snap.net_debt = snap.total_debt - snap.total_cash
-
-    # derive market cap from parts if missing
-    if snap.market_cap is None and snap.price and snap.shares:
-        snap.market_cap = float(snap.price) * float(snap.shares)
-
-    # last-resort price from history
-    if snap.price is None:
+        tk = yf.Ticker(ticker)
+        info: dict[str, Any] = {}
         try:
-            h = tk.history(period="5d", auto_adjust=True)
-            if not h.empty:
-                snap.price = float(h["Close"].iloc[-1])
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        fast: dict[str, Any] = {}
+        try:
+            fi = tk.fast_info
+            for k in ("last_price", "market_cap", "shares", "currency"):
+                try:
+                    v = getattr(fi, k, None)
+                    if v is not None:
+                        fast[k] = v
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    # --- 4. Annual financials (income statement) ---
-    try:
-        fin = tk.financials  # index=metrics, columns=dates
-        if fin is not None and not fin.empty:
-            fin = fin.sort_index(axis=1)  # oldest date first
-
-            rev_vals = _series_recent(fin,
-                "Total Revenue", "TotalRevenue", "Revenue")
-            if rev_vals:
-                snap.rev_history = rev_vals
-                snap.rev_growth_history = _yoy(rev_vals)
-                if not snap.revenue_ttm:
-                    snap.revenue_ttm = rev_vals[-1]
-
-            ebit_vals = _series_recent(fin,
-                "EBIT", "Operating Income", "OperatingIncome",
-                "Total Operating Income As Reported")
-            if ebit_vals and not snap.ebit_ttm:
-                snap.ebit_ttm = ebit_vals[-1]
-
-            ni_vals = _series_recent(fin,
-                "Net Income", "Net Income Common Stockholders")
-            if ni_vals:
-                snap.eps_growth_history = _yoy(ni_vals)
-
-            # implied operating margin if missing
-            if (snap.operating_margin is None and snap.revenue_ttm
-                    and snap.ebit_ttm and snap.revenue_ttm > 0):
-                snap.operating_margin = snap.ebit_ttm / snap.revenue_ttm
-    except Exception:
-        pass
-
-    # --- 5. Annual cash flow ---
-    try:
-        cf = tk.cashflow  # index=metrics, columns=dates
-        if cf is not None and not cf.empty:
-            cf = cf.sort_index(axis=1)
-
-            # Prefer "Free Cash Flow" row; fallback: compute CFO - CapEx
-            fcf_vals = _series_recent(cf, "Free Cash Flow")
-            if fcf_vals:
-                snap.fcf_history = fcf_vals
-                if not snap.fcf_ttm or abs(snap.fcf_ttm) < 1e4:
-                    snap.fcf_ttm = fcf_vals[-1]
-                if len(fcf_vals) >= 3:
-                    snap.fcf_3y_avg = float(np.mean(fcf_vals[-3:]))
-            else:
-                cfo_vals = _series_recent(cf, "Operating Cash Flow",
-                    "Total Cash From Operating Activities")
-                capex_vals = _series_recent(cf, "Capital Expenditure")
-                if cfo_vals and capex_vals and len(cfo_vals) == len(capex_vals):
-                    fcf_derived = [
-                        c - abs(k) for c, k in zip(cfo_vals, capex_vals)
-                    ]
-                    snap.fcf_history = fcf_derived
-                    if not snap.fcf_ttm or abs(snap.fcf_ttm) < 1e4:
-                        snap.fcf_ttm = fcf_derived[-1]
-                    if len(fcf_derived) >= 3:
-                        snap.fcf_3y_avg = float(np.mean(fcf_derived[-3:]))
-
-            # D&A
-            da_vals = _series_recent(cf,
-                "Depreciation Amortization Depletion",
-                "Depreciation And Amortization")
-            if da_vals and not snap.da_ttm:
-                snap.da_ttm = da_vals[-1]
-
-            # CapEx (make positive)
-            capex_vals2 = _series_recent(cf, "Capital Expenditure")
-            if capex_vals2:
-                snap.capex_ttm = abs(capex_vals2[-1])
-    except Exception:
-        pass
-
-    # --- 6. Balance sheet (for net debt refinement + ROIC) ---
-    try:
-        bs = tk.balance_sheet
-        if bs is not None and not bs.empty:
-            bs = bs.sort_index(axis=1)
-
-            # yfinance may have a ready "Net Debt" row
-            nd_vals = _series_recent(bs, "Net Debt")
-            if nd_vals:
-                snap.net_debt = nd_vals[-1]
-                snap.total_cash = _first(
-                    _series_recent(bs, "Cash And Cash Equivalents",
-                        "Cash Cash Equivalents And Short Term Investments"),
-                    [snap.total_cash],
-                )[-1] if _series_recent(bs, "Cash And Cash Equivalents",
-                        "Cash Cash Equivalents And Short Term Investments") else snap.total_cash
-                snap.total_debt = snap.net_debt + snap.total_cash
-
-            # ROIC = NOPAT / invested capital
-            ic_vals = _series_recent(bs, "Invested Capital")
-            if ic_vals and snap.ebit_ttm and ic_vals[-1] > 0:
-                tax = float(info.get("effectiveTaxRate") or 0.21)
-                snap.roic = snap.ebit_ttm * (1 - tax) / ic_vals[-1]
-    except Exception:
-        pass
-
-    # --- 7. Analyst 5y growth consensus ---
-    try:
-        ge = tk.growth_estimates
-        if ge is not None and not ge.empty:
-            for period in ("+5y", "5y", "next5years"):
-                if period in ge.index:
-                    row = ge.loc[period]
-                    row = row.dropna() if isinstance(row, pd.Series) else row
-                    if isinstance(row, pd.Series) and not row.empty:
-                        snap.analyst_growth_5y = float(row.iloc[0])
-                        break
-                    elif isinstance(row, (int, float)) and np.isfinite(float(row)):
-                        snap.analyst_growth_5y = float(row)
-                        break
-    except Exception:
-        pass
-
-    # Fallback: analyst estimate from info dict
-    if snap.analyst_growth_5y is None:
-        snap.analyst_growth_5y = _first(
-            g("earningsGrowth"),
-            g("revenueGrowth"),
+        snap.price = (
+            _g(info, "currentPrice", "regularMarketPrice", "previousClose")
+            or fast.get("last_price")
         )
+        snap.market_cap = _g(info, "marketCap") or fast.get("market_cap")
+        snap.shares_outstanding = (
+            _g(info, "sharesOutstanding", "impliedSharesOutstanding")
+            or fast.get("shares")
+        )
+        snap.beta = _g(info, "beta", "beta3Year")
+        snap.forward_pe = _g(info, "forwardPE")
+        snap.trailing_pe = _g(info, "trailingPE")
+        snap.peg = _g(info, "pegRatio", "trailingPegRatio")
+        snap.sector = _g(info, "sector")
+        snap.industry = _g(info, "industry")
+        snap.long_name = _g(info, "longName", "shortName")
+        snap.currency = _g(info, "currency", "financialCurrency") or fast.get("currency") or "USD"
 
-    # --- 8. Beta regression fallback ---
-    if snap.beta is None or abs(float(snap.beta or 0)) < 0.01:
-        snap.beta = _estimate_beta(ticker)
+        # Analyst 5y growth via growth_estimates table (yfinance >=0.2.40)
+        try:
+            ge = tk.growth_estimates
+            if ge is not None and not ge.empty:
+                for period in ("+5y", "5y", "5Y"):
+                    if period in ge.index:
+                        row = ge.loc[period]
+                        v = row.iloc[0] if isinstance(row, pd.Series) else row
+                        if v is not None and np.isfinite(float(v)):
+                            snap.analyst_growth_5y = float(v)
+                            break
+        except Exception:
+            pass
+        if snap.analyst_growth_5y is None:
+            snap.analyst_growth_5y = _g(info, "earningsGrowth", "revenueGrowth")
 
-    # --- 9. Implied cost of debt ---
-    interest = _first(info.get("interestExpense"), info.get("netInterestIncome"))
-    if interest and snap.total_debt and snap.total_debt > 0:
-        snap.cost_of_debt = abs(float(interest)) / snap.total_debt
+        # Last-resort price from 5-day history
+        if snap.price is None:
+            try:
+                hist = tk.history(period="5d", auto_adjust=False)
+                if not hist.empty:
+                    snap.price = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
 
-    # --- 10. Data quality ---
-    if snap.price is None and snap.market_cap is None:
-        snap.data_quality = "ERROR"
-    elif snap.fcf_base is None or snap.revenue_ttm is None:
-        snap.data_quality = "PARTIAL"
-    else:
-        snap.data_quality = "OK"
+        # Derive market cap from parts
+        if snap.market_cap is None and snap.price and snap.shares_outstanding:
+            snap.market_cap = float(snap.price) * float(snap.shares_outstanding)
 
+        # Beta regression fallback
+        if snap.beta is None or abs(float(snap.beta or 0)) < 0.01:
+            snap.beta = _estimate_beta(ticker)
+    except Exception:
+        pass
     return snap
 
-
-# ---------------------------------------------------------------------------
-# beta regression
-# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=128)
 def _estimate_beta(ticker: str) -> float | None:
@@ -372,8 +149,8 @@ def _estimate_beta(ticker: str) -> float | None:
         if len(closes) < 24:
             return None
         rets = closes.pct_change().dropna()
-        cols = rets.columns.tolist()
-        spx = next((c for c in cols if str(c).upper() in ("^GSPC", "GSPC")), None)
+        cols = list(rets.columns)
+        spx = next((c for c in cols if str(c).upper().endswith("GSPC")), None)
         stk = next((c for c in cols if str(c).upper() == ticker.upper()), None)
         if spx is None or stk is None:
             return None
@@ -382,10 +159,6 @@ def _estimate_beta(ticker: str) -> float | None:
     except Exception:
         return None
 
-
-# ---------------------------------------------------------------------------
-# price history
-# ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=128)
 def fetch_price_history(ticker: str, period: str = "5y") -> pd.DataFrame:
@@ -402,13 +175,9 @@ def fetch_price_history(ticker: str, period: str = "5y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
-# risk-free rate
-# ---------------------------------------------------------------------------
-
 @lru_cache(maxsize=1)
 def fetch_risk_free_rate() -> float:
-    """10y US Treasury yield. Returns decimal (e.g. 0.0435). Falls back to 4.35%."""
+    """10y UST yield as decimal. Falls back to 4.35%."""
     if yf is None:
         return 0.0435
     try:
@@ -420,4 +189,7 @@ def fetch_risk_free_rate() -> float:
     return 0.0435
 
 
-__all__ = ["Snapshot", "fetch_snapshot", "fetch_price_history", "fetch_risk_free_rate"]
+__all__ = [
+    "MarketSnapshot", "fetch_market_snapshot",
+    "fetch_price_history", "fetch_risk_free_rate",
+]

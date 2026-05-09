@@ -1,25 +1,23 @@
 """Reverse-DCF and Intrinsic-DCF engines.
 
-Reverse-DCF:  bisection solver that finds the high-growth rate g_h the
-              market implicitly requires to justify today's enterprise value.
+Reverse-DCF: bisection solver for the high-growth rate gʰ that makes the
+             two-stage enterprise PV equal the observed EV (mkt cap + net debt).
 
-Intrinsic-DCF: standard revenue-driven two-stage model that returns a
-               fair value per share given user-supplied assumptions.
+Intrinsic-DCF: revenue-driven FCFF model for the manual sensitivity tab.
 
-Both use a linear fade from the explicit high-growth rate to the terminal
-rate to prevent the terminal value from being artificially inflated.
+Monte-Carlo wrapper: runs the reverse-DCF over a basket of FCF-base scenarios
+(TTM, 3y avg, 5y avg) and returns the mean implied growth + a 1σ band.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# assumptions
+# WACC inputs
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -45,10 +43,14 @@ class WaccInputs:
         return we * self.cost_of_equity + self.debt_weight * self.after_tax_kd
 
 
+# ---------------------------------------------------------------------------
+# DCF inputs
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ReverseDcfInputs:
-    fcf_base: float          # base-year FCF (3y avg preferred)
-    net_debt: float          # total debt - cash
+    fcf_base: float
+    net_debt: float
     shares: float
     wacc: float
     terminal_g: float = 0.025
@@ -76,28 +78,22 @@ class IntrinsicInputs:
 
 
 # ---------------------------------------------------------------------------
-# two-stage enterprise PV
+# two-stage enterprise PV with linear fade
 # ---------------------------------------------------------------------------
 
 def enterprise_pv(growth: float, inp: ReverseDcfInputs) -> float:
-    """PV of enterprise FCFs given an explicit high-growth rate."""
     if inp.wacc <= inp.terminal_g:
         return float("inf")
-    pv = 0.0
-    fcf = inp.fcf_base
-    t = 0
-    # Stage 1: constant high growth
+    pv, fcf, t = 0.0, inp.fcf_base, 0
     for _ in range(inp.high_growth_years):
         fcf *= 1 + growth
         t += 1
         pv += fcf / (1 + inp.wacc) ** t
-    # Stage 2: linear fade to terminal g
     for i in range(1, inp.fade_years + 1):
-        g_fade = growth + (inp.terminal_g - growth) * i / inp.fade_years
-        fcf *= 1 + g_fade
+        g = growth + (inp.terminal_g - growth) * i / inp.fade_years
+        fcf *= 1 + g
         t += 1
         pv += fcf / (1 + inp.wacc) ** t
-    # Terminal value
     tv = fcf * (1 + inp.terminal_g) / (inp.wacc - inp.terminal_g)
     pv += tv / (1 + inp.wacc) ** t
     return pv
@@ -119,42 +115,81 @@ class ReverseDcfResult:
 
 
 def reverse_dcf(market_cap: float, inp: ReverseDcfInputs) -> ReverseDcfResult:
-    """Bisection: find g_h s.t. enterprise_pv(g_h) == market_cap + net_debt."""
+    """Bisection: find gʰ ∈ [-30%, +200%] s.t. enterprise_pv(gʰ) == EV."""
     ev_target = market_cap + inp.net_debt
+    lo, hi = -0.30, 2.00
 
-    lo, hi = -0.30, 1.50
-
-    # Sanity: if even 150% growth can't justify the price, cap it
     ev_hi = enterprise_pv(hi, inp)
     if ev_hi < ev_target:
-        return ReverseDcfResult(
-            implied_growth=hi, converged=False,
-            ev_target=ev_target, ev_model=ev_hi,
-            iterations=0, wacc=inp.wacc, terminal_g=inp.terminal_g,
-        )
-
+        return ReverseDcfResult(hi, False, ev_target, ev_hi, 0,
+                                inp.wacc, inp.terminal_g)
     ev_lo = enterprise_pv(lo, inp)
     if ev_lo > ev_target:
-        return ReverseDcfResult(
-            implied_growth=lo, converged=False,
-            ev_target=ev_target, ev_model=ev_lo,
-            iterations=0, wacc=inp.wacc, terminal_g=inp.terminal_g,
-        )
+        return ReverseDcfResult(lo, False, ev_target, ev_lo, 0,
+                                inp.wacc, inp.terminal_g)
 
-    for itr in range(120):
+    itr = 0
+    for itr in range(150):
         mid = (lo + hi) / 2
-        if enterprise_pv(mid, inp) < ev_target:
+        ev = enterprise_pv(mid, inp)
+        if ev < ev_target:
             lo = mid
         else:
             hi = mid
         if hi - lo < 1e-7:
             break
-
-    g_solved = (lo + hi) / 2
+    g = (lo + hi) / 2
     return ReverseDcfResult(
-        implied_growth=g_solved, converged=True,
-        ev_target=ev_target, ev_model=enterprise_pv(g_solved, inp),
-        iterations=itr + 1, wacc=inp.wacc, terminal_g=inp.terminal_g,
+        implied_growth=g, converged=True, ev_target=ev_target,
+        ev_model=enterprise_pv(g, inp), iterations=itr + 1,
+        wacc=inp.wacc, terminal_g=inp.terminal_g,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Monte-Carlo wrapper over FCF-base scenarios
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MonteCarloResult:
+    point_estimate: float        # implied growth at primary FCF base
+    scenario_growths: dict[str, float]   # label -> implied growth
+    mean: float
+    std: float
+    range_low: float             # mean - 1σ
+    range_high: float            # mean + 1σ
+
+
+def monte_carlo_implied_growth(
+    market_cap: float, base_inp: ReverseDcfInputs,
+    fcf_scenarios: dict[str, float],
+) -> MonteCarloResult:
+    """Run reverse-DCF for several FCF base scenarios; return mean ± 1σ."""
+    growths: dict[str, float] = {}
+    for label, fcf in fcf_scenarios.items():
+        if not fcf or fcf <= 0:
+            continue
+        inp = ReverseDcfInputs(
+            fcf_base=fcf, net_debt=base_inp.net_debt, shares=base_inp.shares,
+            wacc=base_inp.wacc, terminal_g=base_inp.terminal_g,
+            high_growth_years=base_inp.high_growth_years, fade_years=base_inp.fade_years,
+        )
+        r = reverse_dcf(market_cap, inp)
+        if r.converged:
+            growths[label] = r.implied_growth
+    if not growths:
+        return MonteCarloResult(
+            point_estimate=float("nan"), scenario_growths={},
+            mean=float("nan"), std=float("nan"),
+            range_low=float("nan"), range_high=float("nan"),
+        )
+    arr = np.array(list(growths.values()))
+    mean, std = float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+    primary = next(iter(growths.values()))
+    return MonteCarloResult(
+        point_estimate=primary, scenario_growths=growths,
+        mean=mean, std=std,
+        range_low=mean - std, range_high=mean + std,
     )
 
 
@@ -177,15 +212,11 @@ class IntrinsicResult:
 
 
 def intrinsic_dcf(
-    inp: IntrinsicInputs,
-    current_price: float | None = None,
+    inp: IntrinsicInputs, current_price: float | None = None,
 ) -> IntrinsicResult:
-    """Revenue-driven two-stage DCF (FCFF-based)."""
     wacc = inp.wacc
     g = min(inp.terminal_g, wacc - 0.005)
-    rows: list[dict] = []
-    rev = inp.revenue_base
-
+    rev, rows = inp.revenue_base, []
     for t in range(1, inp.projection_years + 1):
         rev_t = rev * (1 + inp.revenue_growth)
         ebit = rev_t * inp.operating_margin
@@ -196,19 +227,11 @@ def intrinsic_dcf(
         fcff = nopat + da - capex - dnwc
         df = (1 + wacc) ** t
         rows.append({
-            "Year": t,
-            "Revenue": rev_t,
-            "EBIT": ebit,
-            "NOPAT": nopat,
-            "D&A": da,
-            "CapEx": capex,
-            "ΔWorking Capital": dnwc,
-            "FCFF": fcff,
-            "Discount Factor": df,
-            "PV FCFF": fcff / df,
+            "Year": t, "Revenue": rev_t, "EBIT": ebit, "NOPAT": nopat,
+            "D&A": da, "CapEx": capex, "ΔNWC": dnwc,
+            "FCFF": fcff, "DiscountFactor": df, "PV FCFF": fcff / df,
         })
         rev = rev_t
-
     proj = pd.DataFrame(rows).set_index("Year")
     last_fcff = float(proj["FCFF"].iloc[-1])
     tv = last_fcff * (1 + g) / (wacc - g)
@@ -217,7 +240,10 @@ def intrinsic_dcf(
     ev = pv_explicit + pv_tv
     equity = ev - inp.net_debt
     fv = equity / inp.shares if inp.shares > 0 else float("nan")
-    upside = (fv / current_price - 1) if (current_price and np.isfinite(fv) and current_price > 0) else None
+    upside = (
+        (fv / current_price - 1)
+        if current_price and np.isfinite(fv) and current_price > 0 else None
+    )
     tv_pct = pv_tv / ev if ev > 0 else 0.0
     return IntrinsicResult(
         projections=proj, terminal_value=tv, pv_terminal=pv_tv,
@@ -228,16 +254,14 @@ def intrinsic_dcf(
 
 
 # ---------------------------------------------------------------------------
-# sensitivity grid (for heatmap)
+# sensitivity grid (heatmap)
 # ---------------------------------------------------------------------------
 
 def sensitivity_grid(
-    inp: IntrinsicInputs,
-    current_price: float | None = None,
+    inp: IntrinsicInputs, current_price: float | None = None,
     wacc_steps: tuple[float, ...] = (-0.02, -0.01, 0.0, +0.01, +0.02),
     g_steps: tuple[float, ...] = (-0.01, -0.005, 0.0, +0.005, +0.01),
 ) -> pd.DataFrame:
-    """Fair value per share over a WACC x terminal-g grid."""
     rows: dict[str, dict[str, float]] = {}
     for dw in wacc_steps:
         w = inp.wacc + dw
@@ -258,16 +282,13 @@ def sensitivity_grid(
 
 
 # ---------------------------------------------------------------------------
-# fair-value vs growth curve (for sensitivity line chart)
+# fair-value vs growth curve
 # ---------------------------------------------------------------------------
 
 def fair_value_curve(
-    inp: ReverseDcfInputs,
-    shares: float,
-    current_price: float | None = None,
-    n_points: int = 40,
+    inp: ReverseDcfInputs, shares: float,
+    current_price: float | None = None, n_points: int = 50,
 ) -> pd.DataFrame:
-    """Fair value per share at each growth rate from -10% to +80%."""
     rows = []
     for g in np.linspace(-0.10, 0.80, n_points):
         ev = enterprise_pv(float(g), inp)
@@ -282,7 +303,8 @@ def fair_value_curve(
 
 __all__ = [
     "WaccInputs", "ReverseDcfInputs", "IntrinsicInputs",
-    "ReverseDcfResult", "IntrinsicResult",
+    "ReverseDcfResult", "IntrinsicResult", "MonteCarloResult",
     "enterprise_pv", "reverse_dcf", "intrinsic_dcf",
+    "monte_carlo_implied_growth",
     "sensitivity_grid", "fair_value_curve",
 ]
