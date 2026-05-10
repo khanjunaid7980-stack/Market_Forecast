@@ -1,0 +1,175 @@
+"""Smart default assumptions."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+
+
+SECTOR_BENCHMARKS: dict[str, dict[str, float]] = {
+    "Technology": {"rev_growth": 0.12, "op_margin": 0.22, "tax": 0.18, "beta": 1.15, "capex_pct_rev": 0.06, "da_pct_rev": 0.05, "nwc_pct_rev": 0.02},
+    "Communication Services": {"rev_growth": 0.07, "op_margin": 0.18, "tax": 0.21, "beta": 1.05, "capex_pct_rev": 0.10, "da_pct_rev": 0.09, "nwc_pct_rev": 0.02},
+    "Consumer Cyclical": {"rev_growth": 0.06, "op_margin": 0.10, "tax": 0.22, "beta": 1.10, "capex_pct_rev": 0.05, "da_pct_rev": 0.04, "nwc_pct_rev": 0.05},
+    "Consumer Defensive": {"rev_growth": 0.04, "op_margin": 0.09, "tax": 0.22, "beta": 0.70, "capex_pct_rev": 0.04, "da_pct_rev": 0.03, "nwc_pct_rev": 0.04},
+    "Healthcare": {"rev_growth": 0.08, "op_margin": 0.14, "tax": 0.18, "beta": 0.85, "capex_pct_rev": 0.05, "da_pct_rev": 0.04, "nwc_pct_rev": 0.06},
+    "Financial Services": {"rev_growth": 0.05, "op_margin": 0.28, "tax": 0.22, "beta": 1.00, "capex_pct_rev": 0.02, "da_pct_rev": 0.02, "nwc_pct_rev": 0.00},
+    "Industrials": {"rev_growth": 0.05, "op_margin": 0.11, "tax": 0.22, "beta": 1.05, "capex_pct_rev": 0.05, "da_pct_rev": 0.04, "nwc_pct_rev": 0.08},
+    "Energy": {"rev_growth": 0.03, "op_margin": 0.12, "tax": 0.24, "beta": 1.20, "capex_pct_rev": 0.12, "da_pct_rev": 0.10, "nwc_pct_rev": 0.02},
+    "Utilities": {"rev_growth": 0.03, "op_margin": 0.18, "tax": 0.20, "beta": 0.55, "capex_pct_rev": 0.18, "da_pct_rev": 0.10, "nwc_pct_rev": 0.01},
+    "Real Estate": {"rev_growth": 0.04, "op_margin": 0.25, "tax": 0.18, "beta": 0.90, "capex_pct_rev": 0.10, "da_pct_rev": 0.15, "nwc_pct_rev": 0.00},
+    "Basic Materials": {"rev_growth": 0.04, "op_margin": 0.12, "tax": 0.22, "beta": 1.10, "capex_pct_rev": 0.08, "da_pct_rev": 0.07, "nwc_pct_rev": 0.06},
+}
+
+DEFAULT_SECTOR = {"rev_growth": 0.06, "op_margin": 0.12, "tax": 0.21, "beta": 1.00, "capex_pct_rev": 0.06, "da_pct_rev": 0.05, "nwc_pct_rev": 0.03}
+
+
+@dataclass
+class Assumptions:
+    revenue_growth_rate: float = 0.06
+    terminal_growth_rate: float = 0.025
+    operating_margin: float = 0.12
+    tax_rate: float = 0.21
+    capex_pct_revenue: float = 0.06
+    da_pct_revenue: float = 0.05
+    nwc_pct_revenue: float = 0.03
+    risk_free_rate: float = 0.0425
+    equity_risk_premium: float = 0.055
+    beta: float = 1.00
+    cost_of_debt_pretax: float = 0.055
+    debt_weight: float = 0.20
+    projection_years: int = 5
+    moat_score: int = 5
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _fit_trend(series: pd.Series) -> float | None:
+    s = series.dropna().astype(float)
+    s = s[s > 0]
+    if len(s) < 3:
+        return None
+    X = np.arange(len(s)).reshape(-1, 1)
+    y = np.log(s.values)
+    try:
+        model = LinearRegression().fit(X, y)
+        return float(np.exp(model.coef_[0]) - 1.0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _blend(company: float | None, sector: float, weight_company: float = 0.6) -> float:
+    if company is None or not np.isfinite(company):
+        return sector
+    return weight_company * company + (1 - weight_company) * sector
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def derive_assumptions(
+    financials: pd.DataFrame,
+    sector: str | None,
+    risk_free_rate: float | None = None,
+    beta: float | None = None,
+) -> Assumptions:
+    bench = SECTOR_BENCHMARKS.get(sector or "", DEFAULT_SECTOR)
+
+    rev_cagr = None
+    op_margin_avg = None
+    capex_pct = None
+    da_pct = None
+    tax_rate_hist = None
+
+    if financials is not None and not financials.empty:
+        if "Revenue" in financials.index:
+            rev_cagr = _fit_trend(financials.loc["Revenue"])
+        if "OperatingIncome" in financials.index and "Revenue" in financials.index:
+            rev = financials.loc["Revenue"].astype(float)
+            op = financials.loc["OperatingIncome"].astype(float)
+            ratios = (op / rev).replace([np.inf, -np.inf], np.nan).dropna()
+            if not ratios.empty:
+                op_margin_avg = float(ratios.tail(3).mean())
+        if "CapEx" in financials.index and "Revenue" in financials.index:
+            cx = financials.loc["CapEx"].astype(float).abs()
+            rev = financials.loc["Revenue"].astype(float)
+            ratios = (cx / rev).replace([np.inf, -np.inf], np.nan).dropna()
+            if not ratios.empty:
+                capex_pct = float(ratios.tail(3).mean())
+        if "DepreciationAmortization" in financials.index and "Revenue" in financials.index:
+            da = financials.loc["DepreciationAmortization"].astype(float)
+            rev = financials.loc["Revenue"].astype(float)
+            ratios = (da / rev).replace([np.inf, -np.inf], np.nan).dropna()
+            if not ratios.empty:
+                da_pct = float(ratios.tail(3).mean())
+        if "IncomeTaxExpense" in financials.index and "PreTaxIncome" in financials.index:
+            tx = financials.loc["IncomeTaxExpense"].astype(float)
+            pt = financials.loc["PreTaxIncome"].astype(float)
+            ratios = (tx / pt).replace([np.inf, -np.inf], np.nan).dropna()
+            ratios = ratios[(ratios > 0) & (ratios < 0.5)]
+            if not ratios.empty:
+                tax_rate_hist = float(ratios.tail(3).mean())
+
+    growth = _clip(_blend(rev_cagr, bench["rev_growth"]), -0.05, 0.35)
+    op_margin = _clip(_blend(op_margin_avg, bench["op_margin"]), -0.10, 0.60)
+    capex = _clip(_blend(capex_pct, bench["capex_pct_rev"]), 0.0, 0.35)
+    da = _clip(_blend(da_pct, bench["da_pct_rev"]), 0.0, 0.25)
+    tax = _clip(_blend(tax_rate_hist, bench["tax"]), 0.0, 0.35)
+
+    beta_final = beta if (beta and np.isfinite(beta)) else bench["beta"]
+    rf = risk_free_rate if (risk_free_rate and np.isfinite(risk_free_rate)) else 0.0425
+    terminal = min(0.025, rf * 0.8)
+
+    return Assumptions(
+        revenue_growth_rate=round(growth, 4),
+        terminal_growth_rate=round(terminal, 4),
+        operating_margin=round(op_margin, 4),
+        tax_rate=round(tax, 4),
+        capex_pct_revenue=round(capex, 4),
+        da_pct_revenue=round(da, 4),
+        nwc_pct_revenue=round(bench["nwc_pct_rev"], 4),
+        risk_free_rate=round(rf, 4),
+        equity_risk_premium=0.055,
+        beta=round(float(beta_final), 3),
+        cost_of_debt_pretax=round(rf + 0.015, 4),
+        debt_weight=0.20,
+        projection_years=5,
+        moat_score=_default_moat_for_sector(sector),
+    )
+
+
+_MOAT_BY_SECTOR: dict[str, int] = {
+    "Technology": 7, "Communication Services": 6, "Consumer Defensive": 7,
+    "Healthcare": 6, "Financial Services": 5, "Consumer Cyclical": 4,
+    "Industrials": 5, "Utilities": 5, "Real Estate": 4, "Energy": 3, "Basic Materials": 3,
+}
+
+
+def _default_moat_for_sector(sector: str | None) -> int:
+    return _MOAT_BY_SECTOR.get(sector or "", 5)
+
+
+ASSUMPTION_HELP: dict[str, str] = {
+    "revenue_growth_rate": "Annual revenue growth during the explicit forecast window.",
+    "terminal_growth_rate": "Perpetual growth after the forecast window. Should be <= long-run GDP / risk-free rate (typically 2-3%).",
+    "operating_margin": "EBIT / Revenue. Pre-filled from trailing 3-year average.",
+    "tax_rate": "Effective tax rate used on EBIT to compute NOPAT.",
+    "capex_pct_revenue": "Capital expenditures as % of revenue.",
+    "da_pct_revenue": "Depreciation & amortization as % of revenue.",
+    "nwc_pct_revenue": "Change in net working capital as % of revenue growth.",
+    "risk_free_rate": "Live 10-year US Treasury yield.",
+    "equity_risk_premium": "Long-run US equity risk premium. Academic consensus ~5-6%.",
+    "beta": "Systematic risk relative to the market.",
+    "cost_of_debt_pretax": "Pre-tax cost of debt.",
+    "debt_weight": "Debt / (Debt + Equity). Target capital structure.",
+    "projection_years": "Length of the explicit-forecast period.",
+    "moat_score": "Qualitative moat (0–10). Mag-7 ≈ 9–10; commodity businesses ≈ 1–3.",
+}
+
+
+__all__ = ["Assumptions", "derive_assumptions", "ASSUMPTION_HELP", "SECTOR_BENCHMARKS"]
