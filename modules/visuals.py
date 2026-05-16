@@ -321,10 +321,218 @@ def implied_growth_sensitivity(
     return fig
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 6: Earnings — LM Sentiment Breakdown (horizontal bar)
+# ─────────────────────────────────────────────────────────────────────────────
+def earnings_sentiment_chart(analysis: "EarningsAnalysis") -> go.Figure:  # type: ignore[name-defined]
+    """Horizontal bar: LM category counts per 1 000 words."""
+    categories  = ["Positive", "Negative", "Uncertainty", "Litigious"]
+    per_1k      = [
+        analysis.pos_per_1k,
+        analysis.neg_per_1k,
+        analysis.unc_per_1k,
+        analysis.lm_litigious / max(analysis.word_count, 1) * 1000,
+    ]
+    colors = [GREEN, RED, AMBER, PURPLE]
+
+    fig = go.Figure(go.Bar(
+        x=per_1k,
+        y=categories,
+        orientation="h",
+        marker_color=colors,
+        text=[f"{v:.1f}" for v in per_1k],
+        textposition="outside",
+        hovertemplate="%{y}: %{x:.2f} per 1k words<extra></extra>",
+    ))
+    _base_layout(fig, "Loughran-McDonald Sentiment (per 1 000 words)")
+    fig.update_xaxes(title_text="Frequency per 1 000 words")
+    fig.update_yaxes(tickfont=dict(size=12))
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 7: Earnings — Sentiment timeline across the call
+# ─────────────────────────────────────────────────────────────────────────────
+def earnings_tone_timeline(para_tones: list[float]) -> go.Figure:
+    """Line chart: rolling tone score by 200-word segment."""
+    if not para_tones:
+        return go.Figure()
+
+    x = list(range(1, len(para_tones) + 1))
+    y = para_tones
+
+    colors = [GREEN if v >= 0 else RED for v in y]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y,
+        mode="lines+markers",
+        line=dict(color=ACCENT, width=2),
+        marker=dict(color=colors, size=7, line=dict(color=BORDER, width=1)),
+        name="Tone score",
+        hovertemplate="Segment %{x}<br>Tone: %{y:.2f}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED, line_width=1)
+    fig.add_hrect(y0=0, y1=1,  fillcolor=GREEN, opacity=0.04, line_width=0)
+    fig.add_hrect(y0=-1, y1=0, fillcolor=RED,   opacity=0.04, line_width=0)
+
+    _base_layout(fig, "Sentiment Flow — 200-Word Segments", hovermode="x unified")
+    fig.update_yaxes(title_text="Tone Score (LM)", range=[-1.05, 1.05])
+    fig.update_xaxes(title_text="Segment (≈ 200 words each)")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 8: Earnings — Topic coverage
+# ─────────────────────────────────────────────────────────────────────────────
+def earnings_topic_chart(topic_hits: dict[str, int]) -> go.Figure:
+    """Horizontal bar: topic mention frequency."""
+    items = sorted(topic_hits.items(), key=lambda kv: kv[1])
+    topics = [k for k, _ in items]
+    counts = [v for _, v in items]
+
+    fig = go.Figure(go.Bar(
+        x=counts, y=topics,
+        orientation="h",
+        marker=dict(
+            color=counts,
+            colorscale=[[0, MUTED], [0.5, ACCENT], [1, GREEN]],
+            showscale=False,
+        ),
+        text=counts,
+        textposition="outside",
+        hovertemplate="%{y}: %{x} mentions<extra></extra>",
+    ))
+    _base_layout(fig, "Key Topic Coverage (keyword mentions)")
+    fig.update_xaxes(title_text="Mention count")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 9: Monte Carlo — Intrinsic value distribution
+# ─────────────────────────────────────────────────────────────────────────────
+def mc_intrinsic_histogram(iv_per_share: np.ndarray, price: float | None) -> go.Figure:
+    """Histogram of simulated intrinsic values with market price overlay."""
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=iv_per_share,
+        nbinsx=60,
+        marker_color=ACCENT,
+        marker_line=dict(width=0.5, color=BORDER),
+        opacity=0.85,
+        name="Simulated IV",
+        hovertemplate="IV: $%{x:,.0f}<br>Count: %{y}<extra></extra>",
+    ))
+    if price is not None:
+        fig.add_vline(
+            x=price, line_color=RED, line_width=2.5,
+            annotation_text=f"  Market ${price:,.2f}",
+            annotation_position="top right",
+            annotation_font_color=RED, annotation_font_size=11,
+        )
+        # Shade undervalued region
+        x_max = float(np.percentile(iv_per_share, 99))
+        if x_max > price:
+            fig.add_vrect(
+                x0=price, x1=x_max,
+                fillcolor=GREEN, opacity=0.07, line_width=0,
+            )
+    _base_layout(fig, "Monte Carlo: Simulated Intrinsic Value per Share")
+    fig.update_xaxes(title_text="Intrinsic Value ($ per share)")
+    fig.update_yaxes(title_text="Frequency")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 10: Monte Carlo — Implied CAGR distribution
+# ─────────────────────────────────────────────────────────────────────────────
+def mc_cagr_histogram(cagr_arr: np.ndarray, base_implied: float | None) -> go.Figure:
+    """Histogram of implied CAGRs across WACC × FCF-margin draws."""
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=cagr_arr * 100,
+        nbinsx=50,
+        marker_color=PURPLE,
+        marker_line=dict(width=0.5, color=BORDER),
+        opacity=0.85,
+        name="Implied CAGR",
+        hovertemplate="CAGR: %{x:.1f}%<br>Count: %{y}<extra></extra>",
+    ))
+    if base_implied is not None and np.isfinite(base_implied):
+        fig.add_vline(
+            x=base_implied * 100, line_color=RED, line_width=2,
+            annotation_text=f"  Base {base_implied*100:.1f}%",
+            annotation_position="top right",
+            annotation_font_color=RED,
+        )
+    _base_layout(fig, "Monte Carlo: Implied Revenue CAGR Sensitivity")
+    fig.update_xaxes(title_text="Implied CAGR (%)")
+    fig.update_yaxes(title_text="Frequency")
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart 11: Monte Carlo — Tornado / OAT sensitivity
+# ─────────────────────────────────────────────────────────────────────────────
+def mc_tornado(
+    sensitivity: dict[str, tuple[float, float, float]],
+    shares: float | None,
+) -> go.Figure:
+    """Horizontal tornado bar: each parameter's low→high IV swing."""
+    scale = shares if (shares and shares > 0) else 1e9
+
+    params, lo_vals, hi_vals, base_vals = [], [], [], []
+    for name, (lo, base, hi) in sorted(
+        sensitivity.items(),
+        key=lambda kv: abs(kv[1][2] - kv[1][0]),
+    ):
+        params.append(name)
+        lo_vals.append(lo / scale)
+        hi_vals.append(hi / scale)
+        base_vals.append(base / scale)
+
+    fig = go.Figure()
+    for i, name in enumerate(params):
+        lo, hi, base = lo_vals[i], hi_vals[i], base_vals[i]
+        fig.add_trace(go.Bar(
+            name=f"↓ {name}",
+            y=[name],
+            x=[lo - base],
+            base=[base],
+            orientation="h",
+            marker_color=RED, opacity=0.8,
+            showlegend=i == 0,
+            hovertemplate=f"{name} (low 1σ): ${{x:.2f}}/share<extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            name=f"↑ {name}",
+            y=[name],
+            x=[hi - base],
+            base=[base],
+            orientation="h",
+            marker_color=GREEN, opacity=0.8,
+            showlegend=i == 0,
+            hovertemplate=f"{name} (high 1σ): ${{x:.2f}}/share<extra></extra>",
+        ))
+
+    label = "$ per share" if shares else "$ equity ($B)"
+    _base_layout(fig, "Sensitivity Tornado: Which Input Drives IV Uncertainty Most?")
+    fig.update_layout(barmode="overlay")
+    fig.update_xaxes(title_text=label)
+    fig.update_yaxes(title_text="Input parameter")
+    return fig
+
+
 __all__ = [
     "rationality_gap_chart",
     "revenue_projection_chart",
     "price_vs_intrinsic",
     "historical_growth_distribution",
     "implied_growth_sensitivity",
+    "earnings_sentiment_chart",
+    "earnings_tone_timeline",
+    "earnings_topic_chart",
+    "mc_intrinsic_histogram",
+    "mc_cagr_histogram",
+    "mc_tornado",
 ]
