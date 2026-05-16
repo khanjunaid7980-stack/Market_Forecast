@@ -10,6 +10,8 @@ Rationality — flag whether the implied rate is Speculative / Rational / Pessim
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -42,34 +44,60 @@ html, body, [class*="css"], [class*="st-"] {
   border: 1px solid #1f2937;
   border-left: 3px solid #4f8cff;
   border-radius: 6px;
-  padding: 11px 15px;
-  flex: 1;
-  min-width: 120px;
+  padding: 10px 14px;
+  flex: 1 1 165px;
+  min-width: 155px;
+  max-width: 100%;
+  overflow: hidden;
 }
 .rvm-card-label {
   color: #6b7280;
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 1.2px;
+  letter-spacing: 1.1px;
   margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rvm-card-value {
   color: #e6edf3;
-  font-size: 19px;
+  font-size: 17px;
   font-weight: 700;
-  line-height: 1.2;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.3px;
 }
 .rvm-card-sub {
   color: #9ca3af;
   font-size: 10px;
   margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rvm-row {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
   margin: 8px 0 16px 0;
 }
+
+/* ── Data freshness badge ── */
+.rvm-stamp {
+  display: inline-block;
+  background: #1f2937;
+  color: #9ca3af;
+  font-size: 10px;
+  padding: 3px 9px;
+  border-radius: 10px;
+  letter-spacing: 0.6px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.rvm-stamp.stale { background: #2d1f07; color: #fbbf24; }
 
 /* ── Verdict badge ── */
 .verdict-badge {
@@ -128,12 +156,18 @@ def _cards(*items: str) -> None:
 
 
 def _fmt_b(v: float) -> str:
-    """Format a dollar value in billions."""
-    if abs(v) >= 1e12:
-        return f"${v/1e12:.2f}T"
-    if abs(v) >= 1e9:
-        return f"${v/1e9:.1f}B"
-    return f"${v/1e6:.0f}M"
+    """Compact dollar value: T / B / M with sign preserved."""
+    if v is None or not np.isfinite(v):
+        return "—"
+    sign = "-" if v < 0 else ""
+    av = abs(v)
+    if av >= 1e12:
+        return f"{sign}${av/1e12:.2f}T"
+    if av >= 1e9:
+        return f"{sign}${av/1e9:.2f}B"
+    if av >= 1e6:
+        return f"{sign}${av/1e6:.0f}M"
+    return f"{sign}${av:,.0f}"
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -147,7 +181,9 @@ with st.sidebar:
     erp     = st.number_input("Equity risk premium (%)", value=5.00, step=0.10, format="%.2f") / 100
     kd_pre  = st.number_input("Pre-tax cost of debt (%)", value=4.50, step=0.10, format="%.2f") / 100
     st.markdown("---")
-    run = st.button("⚡  ANALYSE", type="primary", use_container_width=True)
+    col_run, col_refresh = st.columns([3, 1])
+    run     = col_run.button("⚡  ANALYSE", type="primary", use_container_width=True)
+    refresh = col_refresh.button("🔄", help="Force-refresh live market data (bypass cache)", use_container_width=True)
 
 # ── Gate: only run after first click ─────────────────────────────────────────
 if not run and "rvm_ticker" not in st.session_state:
@@ -174,6 +210,18 @@ if run:
 
 active_ticker = st.session_state.get("rvm_ticker", ticker)
 
+# Force-bust the in-process caches so live price/market-cap re-pull from yfinance.
+if refresh or run:
+    for _fn in (
+        getattr(market_data, "fetch_market_snapshot", None),
+        getattr(market_data, "_estimate_beta", None),
+        getattr(market_data, "fetch_price_history", None),
+        getattr(market_data, "fetch_risk_free_rate", None),
+    ):
+        if _fn is not None and hasattr(_fn, "cache_clear"):
+            _fn.cache_clear()
+    st.session_state["rvm_fetched_at"] = datetime.now(timezone.utc)
+
 ticker_info = edgar.resolve_ticker(active_ticker)
 if not ticker_info:
     st.error(f"Ticker **{active_ticker}** not found in SEC EDGAR. Check the symbol and try again.")
@@ -183,6 +231,8 @@ with st.spinner(f"Pulling SEC EDGAR filings & market data for {active_ticker}…
     facts = edgar.fetch_company_facts(ticker_info["cik"])
     fin   = facts.build_financials(years=10)
     snap  = market_data.fetch_market_snapshot(active_ticker)
+
+fetched_at: datetime | None = st.session_state.get("rvm_fetched_at")
 
 
 # ── Helper: pull a row from the financials DataFrame ─────────────────────────
@@ -308,7 +358,29 @@ ev = (market_cap + net_debt) if market_cap is not None else None
 
 # ── Page header ───────────────────────────────────────────────────────────────
 st.title(f"📡 {active_ticker}  —  Rationality vs. Market")
-st.caption(snap.long_name or ticker_info.get("title", ""))
+
+# Caption with data-freshness badge
+_company = snap.long_name or ticker_info.get("title", "")
+if fetched_at:
+    _age_min = (datetime.now(timezone.utc) - fetched_at).total_seconds() / 60.0
+    _stamp_cls = "rvm-stamp stale" if _age_min > 15 else "rvm-stamp"
+    _stamp = (
+        f'<span class="{_stamp_cls}">Live data fetched '
+        f'{fetched_at.strftime("%Y-%m-%d %H:%M UTC")}</span>'
+    )
+else:
+    _stamp = ""
+st.markdown(
+    f'<div style="color:#9ca3af;font-size:13px;margin-top:-4px;">'
+    f'{_company}{_stamp}</div>',
+    unsafe_allow_html=True,
+)
+if not price or not market_cap:
+    st.markdown(
+        '<div class="rvm-warn">⚠️  Live market data unavailable from yfinance. '
+        'Price / market cap may be missing or stale. Click 🔄 in the sidebar to retry.</div>',
+        unsafe_allow_html=True,
+    )
 
 # Header metric cards — EV decomposition shown explicitly
 _cards(
@@ -330,11 +402,12 @@ _cards(
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_auto, tab_manual, tab_compare, tab_data = st.tabs([
+tab_auto, tab_manual, tab_compare, tab_data, tab_help = st.tabs([
     "🤖  Reverse-DCF (Auto)",
     "🎛️  Manual Sensitivity",
     "⚖️  Rationality Check",
     "📂  Fundamentals",
+    "❓  Help & Methodology",
 ])
 
 
@@ -686,3 +759,224 @@ with tab_data:
             use_container_width=True,
             height=500,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — HELP & METHODOLOGY
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_help:
+    st.subheader("How to use this tool")
+
+    st.markdown("""
+    <div class="rvm-callout">
+      <h4>Quick Start (60 seconds)</h4>
+      <p>
+        <b>1.</b> Type a US-listed ticker (e.g. <code>AAPL</code>, <code>NVDA</code>,
+        <code>META</code>) in the left sidebar.<br>
+        <b>2.</b> Set your macro assumptions (defaults are sensible).<br>
+        <b>3.</b> Click <b>⚡ ANALYSE</b>. Use <b>🔄</b> next to it to force-pull
+        a fresh price from yfinance (bypasses the in-process cache).<br>
+        <b>4.</b> Read the four tabs left-to-right.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### What each tab shows")
+    st.markdown("""
+- **🤖 Reverse-DCF (Auto)** — the core feature. Given today's enterprise value,
+  the engine **solves backward** for the revenue CAGR the market is pricing in.
+  This is not a forecast; it's an *implicit assumption* baked into the share price.
+- **🎛️ Manual Sensitivity** — you supply your own assumptions (growth, margin,
+  WACC, terminal g). The engine computes an intrinsic per-share value and shows
+  margin of safety vs. the live market price.
+- **⚖️ Rationality Check** — statistical test. We compare the implied CAGR
+  against the firm's own historical YoY growth distribution and flag the gap
+  as *Speculative*, *Elevated*, *Rational*, *Cautious*, or *Pessimistic*.
+- **📂 Fundamentals** — raw 10-K data pulled from SEC EDGAR XBRL. Trust the
+  source: no third-party scraping.
+""")
+
+    st.markdown("### Header cards — what the six top-row numbers mean")
+    st.markdown("""
+| Card | Meaning |
+|------|---------|
+| **Price** | Latest trade price from yfinance |
+| **Market Cap** | Shares outstanding × Price |
+| **Net Debt** | Long-term + Short-term debt − Cash & equivalents (latest 10-K) |
+| **Enterprise Value** | Market Cap + Net Debt — this is what we discount cash flows to |
+| **Beta (β)** | From yfinance; falls back to 5-yr monthly regression vs. S&P 500 |
+| **WACC (est.)** | Auto-derived from CAPM equity cost + after-tax debt cost, book-value weighted |
+""")
+
+    st.markdown("### Where the *intrinsic value* in Tab 2 comes from")
+    st.markdown(r"""
+The Manual Sensitivity tab runs a two-stage **Forward DCF** on the assumptions
+you set:
+
+1. **Project annual Free Cash Flow to Firm (FCFF)** for each year of the horizon:
+   $$
+   FCFF_t = Rev_t \times OpMargin \times (1 - Tax) - Rev_t \times CapExPct
+   $$
+   where revenue grows at your chosen rate: $Rev_t = Rev_{t-1} \times (1+g)$.
+
+2. **Discount** each FCFF to present value at WACC:
+   $$
+   PV(FCFF_t) = \frac{FCFF_t}{(1 + WACC)^t}
+   $$
+
+3. **Add a Gordon Growth terminal value** at the end of the horizon:
+   $$
+   TV = \frac{FCFF_N \times (1 + g_T)}{WACC - g_T}, \qquad PV(TV) = \frac{TV}{(1+WACC)^N}
+   $$
+
+4. **Enterprise Value** = sum of PVs.
+   **Equity Value** = EV − Net Debt.
+   **Per-share Intrinsic Value** = Equity / Shares Outstanding.
+
+5. **Margin of Safety** = (Intrinsic − Market Price) / Market Price.
+   Positive → undervalued on your assumptions, negative → overvalued.
+
+Code: `modules/forward_dcf.py :: intrinsic_value()`
+""")
+
+    st.markdown("### Where the *implied growth* in Tab 1 comes from")
+    st.markdown(r"""
+The Reverse-DCF inverts the same DCF. We hold WACC, FCF-margin, terminal g,
+and net debt **fixed**, and ask:
+
+> *What value of $g$ (revenue CAGR) makes the DCF equal today's Enterprise Value?*
+
+Numerically:
+$$
+EV \;=\; \sum_{t=1}^{N} \frac{Rev_0 (1+g)^t \cdot fcfMargin}{(1+WACC)^t}
+       + \frac{Rev_0 (1+g)^N \cdot fcfMargin \cdot (1+g_T)}{(WACC - g_T)(1+WACC)^N}
+$$
+
+We solve for $g$ using **Brent's method** (`scipy.optimize.brentq`) over
+progressively wider brackets ([-30%, +50%] → [-40%, +70%] → [-50%, +90%]).
+
+Code: `modules/reverse_dcf.py :: solve_implied_growth()`
+""")
+
+    st.markdown("### The Rationality Check (Tab 3)")
+    st.markdown(r"""
+We compute the **z-score** of the implied CAGR against the firm's historical
+annual YoY revenue growth distribution:
+$$
+z \;=\; \frac{g_{\text{implied}} - \mu_{\text{YoY}}}{\sigma_{\text{YoY}}}
+$$
+
+| z-score | Verdict | Meaning |
+|---------|---------|---------|
+| z > +2.0 | **Speculative** | Market demands growth far beyond historical track record |
+| +1.0 < z ≤ +2.0 | **Elevated** | Above average, but within plausible range |
+| -1.0 ≤ z ≤ +1.0 | **Rational** | Implied growth sits inside the historical band |
+| -2.0 ≤ z < -1.0 | **Cautious** | Market is more conservative than history |
+| z < -2.0 | **Pessimistic** | Market pricing in a steep deceleration |
+
+Code: `modules/rationality.py :: assess()`
+""")
+
+    st.markdown("---")
+    # ── Bottom: Logic section (per user request) ─────────────────────────────
+    st.markdown("## Logic — How the whole pipeline works")
+
+    st.markdown("""
+The app does **four** things every time you click ANALYSE. Here is the full
+pipeline, in order:
+""")
+
+    st.markdown("""
+**Step 1 — Resolve the ticker on SEC EDGAR.**
+`modules/edgar.py :: resolve_ticker()` hits the SEC EDGAR ticker→CIK map. If
+the symbol isn't a US-listed filer, we stop with an error.
+
+**Step 2 — Pull 10 years of annual fundamentals from SEC XBRL.**
+`edgar.fetch_company_facts(cik)` pulls every reported concept (Revenues,
+NetIncome, CashFromOps, CapitalExpenditures, LongTermDebt, ShortTermDebt,
+CashAndEquivalents, IncomeTaxExpense, IncomeLoss, etc.) directly from the
+EDGAR XBRL endpoint. No third-party scraping; the data is straight from
+the company's own filings.
+
+**Step 3 — Pull live market data from yfinance.**
+`modules/market_data.py :: fetch_market_snapshot(ticker)` returns: price,
+market cap, shares outstanding, beta, sector tags. The 🔄 button in the
+sidebar clears the in-process cache so the next call re-hits yfinance.
+If a value comes back stale, that's because the underlying yfinance
+endpoint is rate-limited or temporarily unavailable — the freshness badge
+at the top will turn amber.
+
+**Step 4 — Derive every input the DCF needs, then run both engines.**
+
+*Cost of capital (WACC):*
+We estimate the after-tax weighted cost of capital from book-value weights.
+""")
+
+    st.latex(r"""
+    \begin{aligned}
+      k_e \,&=\, R_f + \beta \cdot ERP \\
+      k_d^{\,at} \,&=\, k_d^{\,pre} \cdot (1 - \tau) \\
+      w_d \,&=\, \frac{TotalDebt}{TotalDebt + MarketCap} \\
+      WACC \,&=\, (1 - w_d)\,k_e + w_d\,k_d^{\,at}
+    \end{aligned}
+    """)
+
+    st.markdown("""
+*Effective tax rate:* 3-year median of `IncomeTaxExpense / PreTaxIncome`,
+clamped to the [10%, 45%] band so one bad year doesn't poison the result.
+
+*FCF margin* (the steady-state ratio of free cash flow to revenue):
+We try **two derivations** and pick the more reliable one:
+
+1. **CFO-based** — 3-year median of `(CFO − CapEx) / Revenue`. Preferred
+   when the firm has clean cash-flow statements.
+2. **NOPAT-based fallback** — `EBIT × (1 − tax) × (1 − reinvest_rate) / Rev`,
+   where reinvest_rate ≈ CapEx / NOPAT, capped at 80%. Used when CFO data
+   is sparse or negative.
+
+If both fall below 1%, we use a 10% default and **flag a warning** on the
+Auto tab — because a sub-1% derived FCF margin almost always means the
+extraction missed something, and a Reverse-DCF on a near-zero margin will
+return nonsense.
+
+*Net debt:* `LongTermDebt + ShortTermDebt − Cash` from the latest 10-K.
+
+*Enterprise Value:* `MarketCap + NetDebt`. This is what we solve to in
+the Reverse-DCF, not the equity market cap directly — that's the academically
+correct way to handle leverage in a DCF.
+
+*Terminal Value % diagnostic:* When the Reverse-DCF converges, we
+report what fraction of EV comes from the terminal period vs. the
+explicit-period cash flows. If TV% > 75%, we flag a warning — the
+valuation is essentially entirely a bet on terminal growth, and small
+changes in `g_T` materially shift the implied CAGR.
+
+**Step 5 — Two parallel solvers run.**
+
+| Engine | File | Question it answers |
+|--------|------|---------------------|
+| Reverse-DCF | `modules/reverse_dcf.py` | What CAGR does the current price imply? |
+| Forward DCF | `modules/forward_dcf.py` | What is the per-share value at *my* assumptions? |
+| Rationality | `modules/rationality.py` | Is the implied CAGR realistic vs. history? |
+
+The Reverse-DCF uses Brent's root-finder with three progressively wider
+brackets so it converges even for extreme valuations. The Rationality
+engine uses both the YoY growth distribution (z-score) and the 3-yr / 5-yr
+realised CAGRs as cross-checks.
+""")
+
+    st.markdown("### Caveats")
+    st.markdown("""
+- **Price data depends on yfinance**, which depends on Yahoo's public
+  endpoint being up and current. Use the 🔄 button if a value looks stale.
+- **FCF margin is the single most influential lever** in a DCF. Always sanity-check
+  the auto-derived margin against management commentary or your own view.
+- **Reverse-DCF is descriptive, not prescriptive.** It tells you what
+  growth the market is pricing in. Whether that growth is achievable is
+  your judgement call — the Rationality Check is a starting point, not
+  an oracle.
+- **No analyst consensus is used anywhere.** The implied CAGR is derived
+  purely from price + fundamentals + your WACC/terminal-g choice. Two
+  identical companies with the same fundamentals but different prices
+  will produce different implied CAGRs — that's the whole point.
+""")
