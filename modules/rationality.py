@@ -1,123 +1,104 @@
-"""Rationality Gate — compares the market-implied growth rate against the
-company's own historical growth distribution.
+"""Rationality Check — classify the market-implied growth vs. company history.
 
-Verdict ladder:
-  Rational      z ≤ 1.0
-  Stretched     1.0 < z ≤ 2.0
-  Speculative   2.0 < z ≤ 3.0
-  Bubble-like   z > 3.0
-  Insufficient  fewer than 3 data points
+Primary rule (z-score on annual YoY revenue growth):
+    z = (g_implied − μ_YoY) / σ_YoY
+    z > +2.0  →  "Speculative"   market demands far above historical pace
+    z < −2.0  →  "Pessimistic"   market assumes far below historical pace
+    else       →  "Rational"      implied growth is within the historical band
+
+Secondary reference:
+    Compare implied g also against the 3-year and 5-year realised CAGRs,
+    which are more stable than YoY mean for volatile revenue series.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
+import pandas as pd
 
 
 @dataclass
-class RationalityResult:
-    implied_growth: float
-    historical_mean: float
-    historical_std: float
-    historical_min: float
-    historical_max: float
-    historical_n: int
-    z_score: float
-    verdict: str
-    verdict_color: str
-    rationale: str
-    analyst_growth: float | None
-    analyst_delta: float | None
-
-    @property
-    def emoji(self) -> str:
-        return {
-            "Rational": "✅", "Stretched": "⚠️",
-            "Speculative": "🚨", "Bubble-like": "🔥",
-            "Insufficient Data": "ℹ️",
-        }.get(self.verdict, "")
+class RationalityVerdict:
+    implied_growth: float           # market-implied CAGR (decimal)
+    hist_mean: float                # mean of annual YoY growth rates
+    hist_std: float                 # std-dev of annual YoY growth rates
+    hist_cagr_3yr: float | None     # realised 3-year CAGR
+    hist_cagr_5yr: float | None     # realised 5-year CAGR
+    z_score: float                  # (implied − μ) / σ
+    verdict: str                    # Speculative | Rational | Pessimistic | Insufficient Data
+    rationality_gap: float | None   # implied − hist_mean (percentage points if × 100)
+    color: str                      # hex colour for UI badge
 
 
-def _winsorised_stats(xs: list[float]) -> tuple[float, float]:
-    arr = np.array([x for x in xs if np.isfinite(x)], dtype=float)
-    if len(arr) < 2:
-        return float("nan"), float("nan")
-    mean = float(np.mean(arr))
-    std_raw = float(np.std(arr, ddof=1))
-    if std_raw == 0:
-        return mean, 0.0
-    clipped = np.clip(arr, mean - 3 * std_raw, mean + 3 * std_raw)
-    return float(np.mean(clipped)), float(np.std(clipped, ddof=1))
+def _cagr(s: pd.Series, n: int) -> float | None:
+    s = s.dropna().astype(float)
+    if len(s) < n + 1:
+        return None
+    end, start = float(s.iloc[-1]), float(s.iloc[-(n + 1)])
+    if start <= 0 or end <= 0:
+        return None
+    return (end / start) ** (1.0 / n) - 1.0
 
 
-def rationality_check(
-    implied_growth: float,
-    rev_growth_history: Sequence[float],
-    eps_growth_history: Sequence[float],
-    fcf_growth_history: Sequence[float] = (),
-    analyst_growth_5y: float | None = None,
-) -> RationalityResult:
-    pool = [x for x in list(rev_growth_history) + list(eps_growth_history)
-            + list(fcf_growth_history) if np.isfinite(x)]
+def historical_growth_stats(revenue: pd.Series) -> tuple[float | None, float | None, list[float]]:
+    """Returns (mean_yoy, std_yoy, list_of_yoy_rates)."""
+    s = revenue.dropna().astype(float)
+    if len(s) < 3:
+        return None, None, []
+    growths = s.pct_change().dropna().tolist()
+    if not growths:
+        return None, None, []
+    mean = float(np.mean(growths))
+    std = float(np.std(growths, ddof=1)) if len(growths) > 1 else 0.0
+    return mean, std, growths
 
-    if len(pool) < 3:
-        return RationalityResult(
-            implied_growth=implied_growth, historical_mean=float("nan"),
-            historical_std=float("nan"), historical_min=float("nan"),
-            historical_max=float("nan"), historical_n=len(pool),
-            z_score=0.0, verdict="Insufficient Data",
-            verdict_color="#7d8693",
-            rationale="Fewer than 3 historical growth observations — z-score not meaningful.",
-            analyst_growth=analyst_growth_5y, analyst_delta=None,
+
+def assess(implied_growth: float | None, revenue: pd.Series) -> RationalityVerdict:
+    nan = float("nan")
+
+    if implied_growth is None or not np.isfinite(implied_growth):
+        return RationalityVerdict(
+            nan, nan, nan, None, None, nan,
+            "Insufficient Data", None, "#6b7280",
         )
 
-    mean, std = _winsorised_stats(pool)
-    if std < 1e-6:
-        std = abs(mean) * 0.10 + 0.01
-    z = (implied_growth - mean) / std
+    mean, std, _ = historical_growth_stats(revenue)
+    cagr_3 = _cagr(revenue, 3)
+    cagr_5 = _cagr(revenue, 5)
 
-    if z > 3.0:
-        verdict, color = "Bubble-like", "#dc2626"
-        rationale = (
-            f"Market-implied growth ({implied_growth*100:.1f}%) exceeds the "
-            f"5-year historical mean ({mean*100:.1f}%) by more than 3σ. "
-            "Today's price requires a regime change well beyond anything the "
-            "company has demonstrated."
+    if mean is None:
+        return RationalityVerdict(
+            implied_growth, nan, nan, cagr_3, cagr_5, nan,
+            "Insufficient Data", None, "#6b7280",
         )
-    elif z > 2.0:
+
+    z = (implied_growth - mean) / std if (std and std > 0) else 0.0
+    gap = implied_growth - mean
+
+    if z > 2.0:
         verdict, color = "Speculative", "#ef4444"
-        rationale = (
-            f"Implied growth sits >2σ above the historical mean. "
-            "The market is pricing a meaningfully better future than the past."
-        )
     elif z > 1.0:
-        verdict, color = "Stretched", "#f59e0b"
-        rationale = (
-            "Implied growth is >1σ above historical — elevated but not extreme. "
-            "Justifiable for high-quality compounders."
-        )
+        verdict, color = "Elevated", "#f59e0b"
+    elif z < -2.0:
+        verdict, color = "Pessimistic", "#f59e0b"
+    elif z < -1.0:
+        verdict, color = "Cautious", "#60a5fa"
     else:
         verdict, color = "Rational", "#22c55e"
-        rationale = (
-            "Implied growth is within ±1σ of the historical mean. "
-            "Today's price aligns with what the company has actually delivered."
-        )
 
-    analyst_delta = (
-        implied_growth - analyst_growth_5y
-        if analyst_growth_5y is not None else None
-    )
-    return RationalityResult(
+    return RationalityVerdict(
         implied_growth=implied_growth,
-        historical_mean=mean, historical_std=std,
-        historical_min=float(min(pool)), historical_max=float(max(pool)),
-        historical_n=len(pool),
-        z_score=float(z), verdict=verdict, verdict_color=color,
-        rationale=rationale,
-        analyst_growth=analyst_growth_5y, analyst_delta=analyst_delta,
+        hist_mean=mean,
+        hist_std=std or 0.0,
+        hist_cagr_3yr=cagr_3,
+        hist_cagr_5yr=cagr_5,
+        z_score=z,
+        verdict=verdict,
+        rationality_gap=gap,
+        color=color,
     )
 
 
-__all__ = ["RationalityResult", "rationality_check"]
+__all__ = ["RationalityVerdict", "historical_growth_stats", "assess"]
