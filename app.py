@@ -402,33 +402,42 @@ if not price or not market_cap:
         unsafe_allow_html=True,
     )
 
-# Header metric cards — EV decomposition shown explicitly
+# Header — minimal context inputs to the Reverse-DCF. Not a screener readout.
 _cards(
-    _card("Price", f"${price:,.2f}"         if price      else "—"),
-    _card("Market Cap", _fmt_b(market_cap)  if market_cap else "—", sub="Shares × Price"),
-    _card("Net Debt",
-          _fmt_b(net_debt),
-          sub="Debt − Cash",
-          accent="#ef4444" if net_debt > 0 else "#22c55e"),
+    _card("Live price", f"${price:,.2f}" if price else "—",
+          sub="Latest yfinance trade"),
     _card("Enterprise Value",
-          _fmt_b(ev)                         if ev is not None else "—",
-          sub="MCap + Net Debt",
+          _fmt_b(ev) if ev is not None else "—",
+          sub=f"MCap {_fmt_b(market_cap) if market_cap else '—'} + Net Debt {_fmt_b(net_debt)}",
           accent="#f59e0b"),
-    _card("Beta (β)", f"{beta:.2f}"),
     _card("WACC (est.)", f"{wacc_est*100:.2f}%",
-          sub=f"ke={ke*100:.1f}% | kd={kd_at*100:.1f}%"),
+          sub=f"β={beta:.2f}  ·  ke={ke*100:.1f}%  ·  kd_at={kd_at*100:.1f}%"),
+    _card("Base revenue",
+          _fmt_b(base_rev),
+          sub=f"FY{int(revenue.index[-1])} actuals (XBRL)"),
+)
+
+st.markdown(
+    '<div class="rvm-callout" style="border-left: 3px solid #4f8cff;">'
+    '<h4>This is not a stock screener.</h4>'
+    '<p>One question, answered with rigour: '
+    '<b style="color:#4f8cff;">at today\'s market price, what revenue growth rate is '
+    'the market implicitly demanding?</b> The DCF runs <i>backwards</i> — price is the '
+    'input, growth is the output. Everything else (Counter-Hypothesis, Rationality, '
+    'Monte Carlo, Earnings Intel) interrogates whether that implied growth is plausible.'
+    '</p></div>',
+    unsafe_allow_html=True,
 )
 
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_auto, tab_manual, tab_compare, tab_mc, tab_earn, tab_data, tab_help = st.tabs([
+tab_auto, tab_manual, tab_compare, tab_mc, tab_earn, tab_help = st.tabs([
     "🤖  Reverse-DCF (Auto)",
-    "🎛️  Manual Sensitivity",
+    "🎛️  Counter-Hypothesis",
     "⚖️  Rationality Check",
     "🎲  Monte Carlo",
     "📞  Earnings Intel",
-    "📂  Fundamentals",
     "❓  Help & Methodology",
 ])
 
@@ -484,37 +493,64 @@ with tab_auto:
         if result.converged and result.implied_growth is not None:
             verdict = assess(result.implied_growth, revenue)
 
-            # ── Key result metrics ────────────────────────────────────────────
+            # ── HERO: The Answer ──────────────────────────────────────────────
+            st.markdown(
+                f'''
+                <div style="
+                    background: linear-gradient(135deg, #141a2a 0%, #0b0f19 100%);
+                    border: 1px solid #1f2937;
+                    border-left: 6px solid {verdict.color};
+                    border-radius: 8px;
+                    padding: 22px 28px;
+                    margin: 14px 0 18px 0;">
+                  <div style="color:#6b7280;font-size:11px;letter-spacing:2px;
+                              text-transform:uppercase;margin-bottom:6px;">
+                    The market is implicitly demanding
+                  </div>
+                  <div style="color:{verdict.color};font-size:54px;
+                              font-weight:800;line-height:1;letter-spacing:-1.5px;">
+                    {result.implied_growth*100:+.2f}%
+                  </div>
+                  <div style="color:#9ca3af;font-size:13px;margin-top:6px;">
+                    annual revenue growth, every year for the next {forecast_years} years,
+                    to justify today's enterprise value of <b style="color:#e6edf3;">{_fmt_b(ev)}</b>.
+                  </div>
+                  <div style="margin-top:14px;">
+                    <span class="verdict-badge"
+                          style="background:{verdict.color};color:#0b0f19;
+                                 padding:6px 16px;font-size:12px;margin:0;">
+                      {verdict.verdict.upper()}
+                    </span>
+                    <span style="color:#9ca3af;font-size:12px;margin-left:14px;">
+                      z = {verdict.z_score:+.2f}σ vs. historical YoY distribution
+                    </span>
+                  </div>
+                </div>
+                ''',
+                unsafe_allow_html=True,
+            )
+
+            # ── Supporting context (smaller cards) ────────────────────────────
             _cards(
-                _card("Implied Revenue CAGR",
-                      f"{result.implied_growth*100:.2f}%",
-                      sub=f"{forecast_years}-yr horizon",
-                      accent=verdict.color),
-                _card("Historical Avg (YoY)",
+                _card("Historical YoY mean",
                       f"{verdict.hist_mean*100:.2f}%"
                       if np.isfinite(verdict.hist_mean) else "—",
-                      sub="Mean of annual growth rates"),
+                      sub="Mean of annual rates"),
                 _card("Historical σ",
                       f"{verdict.hist_std*100:.2f} pp"
                       if np.isfinite(verdict.hist_std) else "—",
                       sub="Std-dev of YoY rates"),
-                _card("Z-score",
-                      f"{verdict.z_score:+.2f}σ"
-                      if np.isfinite(verdict.z_score) else "—",
-                      sub="(Implied − Hist.avg) / σ",
-                      accent=verdict.color),
+                _card("5-yr realised CAGR",
+                      f"{verdict.hist_cagr_5yr*100:.2f}%"
+                      if verdict.hist_cagr_5yr is not None else "—",
+                      sub="Endpoint-to-endpoint"),
+                _card("Implied final revenue",
+                      _fmt_b(result.implied_revenue_final),
+                      sub=f"Year {forecast_years} target"),
                 _card("Terminal Value %",
                       f"{result.tv_pct*100:.0f}%",
-                      sub="% of EV from terminal period",
-                      accent="#f59e0b" if result.tv_pct > 0.70 else "#4f8cff"),
-            )
-
-            # ── Verdict badge ─────────────────────────────────────────────────
-            st.markdown(
-                f'<div class="verdict-badge" '
-                f'style="background:{verdict.color};color:#0b0f19;">'
-                f'MARKET VERDICT: {verdict.verdict.upper()}</div>',
-                unsafe_allow_html=True,
+                      sub="% of EV from terminal",
+                      accent=AMBER if result.tv_pct > 0.70 else ACCENT),
             )
 
             # ── TV% warning ───────────────────────────────────────────────────
@@ -581,6 +617,31 @@ with tab_auto:
                     use_container_width=True,
                 )
 
+            # ── Raw fundamentals (collapsed — context, not a screener output) ─
+            with st.expander("📂  Raw SEC EDGAR fundamentals (10-K context)"):
+                st.caption(
+                    f"Annual XBRL data underpinning the analysis · "
+                    f"{fin.shape[1] if not fin.empty else 0} fiscal years · "
+                    f"{fin.shape[0] if not fin.empty else 0} line items · "
+                    f"FCF margin used: {fcf_margin_hist*100:.1f}% ({fcf_margin_label})"
+                )
+                if fin.empty:
+                    st.info("No fundamental data available from SEC EDGAR for this ticker.")
+                else:
+                    def _fmt_fin(v: float) -> str:
+                        if pd.isna(v):
+                            return "—"
+                        if abs(v) >= 1e9:
+                            return f"${v/1e9:.2f}B"
+                        if abs(v) >= 1e6:
+                            return f"${v/1e6:.1f}M"
+                        return f"{v:,.0f}"
+                    st.dataframe(
+                        fin.style.format(_fmt_fin, na_rep="—"),
+                        use_container_width=True,
+                        height=420,
+                    )
+
         else:
             st.error(
                 f"Solver could not converge. {result.failure_reason} "
@@ -589,14 +650,15 @@ with tab_auto:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — MANUAL SENSITIVITY (Forward DCF)
+# TAB 2 — COUNTER-HYPOTHESIS (test your view against the market's implicit one)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_manual:
-    st.subheader("Forward DCF — Your Own Assumptions")
+    st.subheader("Counter-Hypothesis — Your View vs. the Market's")
     st.markdown(
-        "<p style='color:#6b7280;font-size:12px;margin-top:-8px;'>"
-        "Enter your view on growth and profitability. The tool computes intrinsic value "
-        "and shows how far it diverges from the market price.</p>",
+        "<p style='color:#9ca3af;font-size:13px;margin-top:-4px;'>"
+        "The Auto tab told you what growth the market is <i>implicitly</i> demanding. "
+        "Here, state what <b>you</b> believe will happen — and see whether your view "
+        "implies the stock is mis-priced. This is a thesis stress-test, not a screener.</p>",
         unsafe_allow_html=True,
     )
 
@@ -1048,41 +1110,6 @@ with tab_earn:
             f'{"Elevated — review 10-K risk factors for active litigation." if ea.lm_litigious > 20 else "Unremarkable."}'
             f'</p></div>',
             unsafe_allow_html=True,
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — FUNDAMENTALS
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_data:
-    st.subheader(f"Annual Fundamentals — {active_ticker} (SEC EDGAR 10-K)")
-
-    col_info1, col_info2, col_info3 = st.columns(3)
-    col_info1.metric("Fiscal years", str(fin.shape[1]) if not fin.empty else "0")
-    col_info2.metric("Line items", str(fin.shape[0]) if not fin.empty else "0")
-    col_info3.metric(
-        "FCF margin used",
-        f"{fcf_margin_hist*100:.1f}%",
-        help=fcf_margin_label,
-    )
-
-    if fin.empty:
-        st.warning("No fundamental data available from SEC EDGAR for this ticker.")
-    else:
-        def _fmt_fin(v: float) -> str:
-            if pd.isna(v):
-                return "—"
-            if abs(v) >= 1e9:
-                return f"${v/1e9:.2f}B"
-            if abs(v) >= 1e6:
-                return f"${v/1e6:.1f}M"
-            return f"{v:,.0f}"
-
-        display_df = fin.copy()
-        st.dataframe(
-            display_df.style.format(_fmt_fin, na_rep="—"),
-            use_container_width=True,
-            height=500,
         )
 
 
