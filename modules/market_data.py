@@ -1,16 +1,22 @@
-"""Market data via yfinance (free, no API key)."""
+"""Live market data via yfinance.
 
+EDGAR (modules/edgar.py) is the primary fundamentals source.
+This module is a thin wrapper around yfinance for the bits SEC doesn't serve:
+live price, market cap, beta, sector tags, forward multiples, and — when
+available — the analyst 5-year growth consensus.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 try:
     import yfinance as yf
-except Exception:  # noqa: BLE001
+except ImportError:
     yf = None  # type: ignore[assignment]
 
 
@@ -21,152 +27,169 @@ class MarketSnapshot:
     market_cap: float | None = None
     shares_outstanding: float | None = None
     beta: float | None = None
+    forward_pe: float | None = None
+    trailing_pe: float | None = None
+    peg: float | None = None
     sector: str | None = None
     industry: str | None = None
-    currency: str | None = None
     long_name: str | None = None
+    currency: str = "USD"
+    analyst_growth_5y: float | None = None  # decimal
 
     @property
     def is_valid(self) -> bool:
         return self.price is not None or self.market_cap is not None
 
 
-def _get(info: dict[str, Any], *keys: str) -> Any:
+def _g(info: dict[str, Any], *keys: str) -> Any:
     for k in keys:
         v = info.get(k)
-        if v not in (None, "", float("nan")):
-            return v
+        if v is not None:
+            try:
+                if v == v:
+                    return v
+            except Exception:
+                return v
     return None
-
-
-_MOCK_SNAPSHOTS = {
-    "AAPL": MarketSnapshot(
-        ticker="AAPL",
-        price=234.15,
-        market_cap=2_310_000_000_000.0,
-        shares_outstanding=15_600_000_000.0,
-        beta=1.24,
-        sector="Technology",
-        industry="Consumer Electronics",
-        currency="USD",
-        long_name="Apple Inc.",
-    ),
-    "MSFT": MarketSnapshot(
-        ticker="MSFT",
-        price=429.46,
-        market_cap=3_210_000_000_000.0,
-        shares_outstanding=7_470_000_000.0,
-        beta=0.90,
-        sector="Technology",
-        industry="Software—Infrastructure",
-        currency="USD",
-        long_name="Microsoft Corporation",
-    ),
-}
 
 
 @lru_cache(maxsize=128)
 def fetch_market_snapshot(ticker: str) -> MarketSnapshot:
     snap = MarketSnapshot(ticker=ticker.upper())
-
-    mock = _MOCK_SNAPSHOTS.get(ticker.upper())
-    if mock is not None:
-        return mock
-
     if yf is None:
         return snap
-
     try:
         tk = yf.Ticker(ticker)
         info: dict[str, Any] = {}
         try:
             info = tk.info or {}
-        except Exception:  # noqa: BLE001
+        except Exception:
             info = {}
-
         fast: dict[str, Any] = {}
         try:
             fi = tk.fast_info
-            for k in ("last_price", "previous_close", "market_cap", "shares", "currency", "quote_type"):
+            for k in ("last_price", "market_cap", "shares", "currency"):
                 try:
                     v = getattr(fi, k, None)
                     if v is not None:
                         fast[k] = v
-                except Exception:  # noqa: BLE001
-                    continue
-        except Exception:  # noqa: BLE001
-            fast = {}
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         snap.price = (
-            _get(info, "currentPrice", "regularMarketPrice", "previousClose")
+            _g(info, "currentPrice", "regularMarketPrice", "previousClose")
             or fast.get("last_price")
-            or fast.get("previous_close")
         )
-        snap.market_cap = _get(info, "marketCap") or fast.get("market_cap")
+        snap.market_cap = _g(info, "marketCap") or fast.get("market_cap")
         snap.shares_outstanding = (
-            _get(info, "sharesOutstanding", "impliedSharesOutstanding")
+            _g(info, "sharesOutstanding", "impliedSharesOutstanding")
             or fast.get("shares")
         )
-        snap.beta = _get(info, "beta", "beta3Year")
-        snap.sector = _get(info, "sector")
-        snap.industry = _get(info, "industry")
-        snap.currency = _get(info, "currency", "financialCurrency") or fast.get("currency")
-        snap.long_name = _get(info, "longName", "shortName")
+        snap.beta = _g(info, "beta", "beta3Year")
+        snap.forward_pe = _g(info, "forwardPE")
+        snap.trailing_pe = _g(info, "trailingPE")
+        snap.peg = _g(info, "pegRatio", "trailingPegRatio")
+        snap.sector = _g(info, "sector")
+        snap.industry = _g(info, "industry")
+        snap.long_name = _g(info, "longName", "shortName")
+        snap.currency = _g(info, "currency", "financialCurrency") or fast.get("currency") or "USD"
 
+        # Analyst 5y growth via growth_estimates table (yfinance >=0.2.40)
+        try:
+            ge = tk.growth_estimates
+            if ge is not None and not ge.empty:
+                for period in ("+5y", "5y", "5Y"):
+                    if period in ge.index:
+                        row = ge.loc[period]
+                        v = row.iloc[0] if isinstance(row, pd.Series) else row
+                        if v is not None and np.isfinite(float(v)):
+                            snap.analyst_growth_5y = float(v)
+                            break
+        except Exception:
+            pass
+        if snap.analyst_growth_5y is None:
+            snap.analyst_growth_5y = _g(info, "earningsGrowth", "revenueGrowth")
+
+        # Last-resort price from 5-day history
         if snap.price is None:
             try:
                 hist = tk.history(period="5d", auto_adjust=False)
                 if not hist.empty:
                     snap.price = float(hist["Close"].iloc[-1])
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
+        # Derive market cap from parts
         if snap.market_cap is None and snap.price and snap.shares_outstanding:
             snap.market_cap = float(snap.price) * float(snap.shares_outstanding)
 
-        if snap.is_valid:
-            return snap
-        else:
-            return _MOCK_SNAPSHOTS.get(ticker.upper(), snap)
+        # Beta regression fallback
+        if snap.beta is None or abs(float(snap.beta or 0)) < 0.01:
+            snap.beta = _estimate_beta(ticker)
+    except Exception:
+        pass
+    return snap
 
-    except Exception:  # noqa: BLE001
-        return _MOCK_SNAPSHOTS.get(ticker.upper(), snap)
+
+@lru_cache(maxsize=128)
+def _estimate_beta(ticker: str) -> float | None:
+    if yf is None:
+        return None
+    try:
+        data = yf.download(
+            [ticker, "^GSPC"], period="5y", interval="1mo",
+            auto_adjust=True, progress=False, threads=False,
+        )
+        if data is None or data.empty:
+            return None
+        closes = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+        closes = closes.dropna()
+        if len(closes) < 24:
+            return None
+        rets = closes.pct_change().dropna()
+        cols = list(rets.columns)
+        spx = next((c for c in cols if str(c).upper().endswith("GSPC")), None)
+        stk = next((c for c in cols if str(c).upper() == ticker.upper()), None)
+        if spx is None or stk is None:
+            return None
+        cov = np.cov(rets[stk].values, rets[spx].values, ddof=1)
+        return float(cov[0, 1] / cov[1, 1]) if cov[1, 1] > 0 else None
+    except Exception:
+        return None
 
 
+@lru_cache(maxsize=128)
 def fetch_price_history(ticker: str, period: str = "5y") -> pd.DataFrame:
     if yf is None:
-        if ticker.upper() == "AAPL":
-            from datetime import datetime
-            dates = pd.date_range(end=datetime.now(), periods=252, freq="D")
-            prices = [150.0 + i * 0.3 for i in range(252)]
-            return pd.DataFrame({"Date": dates, "Close": prices, "Volume": [80_000_000] * 252})
         return pd.DataFrame()
     try:
-        tk = yf.Ticker(ticker)
-        hist = tk.history(period=period, auto_adjust=True)
+        hist = yf.Ticker(ticker).history(period=period, auto_adjust=True)
         if hist.empty:
             return pd.DataFrame()
-        hist = hist.reset_index()
-        return hist[["Date", "Close", "Volume"]]
-    except Exception:  # noqa: BLE001
-        if ticker.upper() == "AAPL":
-            from datetime import datetime
-            dates = pd.date_range(end=datetime.now(), periods=252, freq="D")
-            prices = [150.0 + i * 0.3 for i in range(252)]
-            return pd.DataFrame({"Date": dates, "Close": prices, "Volume": [80_000_000] * 252})
+        hist = hist.reset_index()[["Date", "Close", "Volume"]]
+        hist["Date"] = pd.to_datetime(hist["Date"]).dt.tz_localize(None)
+        return hist
+    except Exception:
         return pd.DataFrame()
 
 
+@lru_cache(maxsize=1)
 def fetch_risk_free_rate() -> float:
+    """10y UST yield as decimal. Falls back to 4.35%."""
     if yf is None:
-        return 0.0425
+        return 0.0435
     try:
         tnx = yf.Ticker("^TNX").history(period="5d")
         if not tnx.empty:
             return float(tnx["Close"].iloc[-1]) / 100.0
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
-    return 0.0425
+    return 0.0435
 
 
-__all__ = ["MarketSnapshot", "fetch_market_snapshot", "fetch_price_history", "fetch_risk_free_rate"]
+__all__ = [
+    "MarketSnapshot", "fetch_market_snapshot",
+    "fetch_price_history", "fetch_risk_free_rate",
+]

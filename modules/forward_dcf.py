@@ -1,23 +1,33 @@
-"""Forward DCF — Manual Sensitivity Mode.
+"""Forward-DCF: compute intrinsic equity value from user-supplied assumptions.
 
-User defines forward assumptions (revenue growth, operating margin, tax,
-CapEx %, WACC, terminal g) and the engine computes intrinsic equity value,
-per-share value, and margin of safety vs. the current market price.
+FCFF model:
+    FCFF_t = Revenue_t × operating_margin × (1 − tax_rate) − Revenue_t × capex_pct
+    Revenue_t = Revenue_{t-1} × (1 + revenue_growth)
+
+Terminal value (Gordon Growth):
+    TV = FCFF_N × (1 + terminal_growth) / (WACC − terminal_growth)
+
+Equity value = PV(FCFFs) + PV(TV) − Net Debt
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 
 @dataclass
 class IntrinsicResult:
-    intrinsic_equity: float
+    intrinsic_equity: float          # EV − net debt
     intrinsic_per_share: float | None
-    margin_of_safety: float | None
-    projections: pd.DataFrame
+    margin_of_safety: float | None   # (intrinsic − price) / price
+    projections: pd.DataFrame        # columns: Revenue, FCFF, PV_FCFF
+    enterprise_value: float
+    pv_explicit: float
+    pv_terminal: float
+    tv_pct: float
 
 
 def intrinsic_value(
@@ -33,33 +43,50 @@ def intrinsic_value(
     current_price: float | None = None,
     net_debt: float = 0.0,
 ) -> IntrinsicResult:
-    """FCFF = Rev × OpMargin × (1−tax) − Rev × capex_pct."""
-    fcf_margin = operating_margin * (1.0 - tax_rate) - capex_pct
-    rows: list[dict] = []
-    pv_total = 0.0
-    for t in range(1, years + 1):
-        rev_t = base_revenue * (1.0 + revenue_growth) ** t
-        fcf_t = rev_t * fcf_margin
-        pv = fcf_t / (1.0 + wacc) ** t
-        pv_total += pv
-        rows.append({"Year": t, "Revenue": rev_t, "FCFF": fcf_t, "PV_FCFF": pv})
+    """Two-stage revenue-driven DCF returning equity intrinsic value."""
+    # Guard: terminal growth must be below WACC
+    term_g = min(terminal_growth, wacc - 0.005)
 
-    rev_N = base_revenue * (1.0 + revenue_growth) ** years
-    fcf_term = rev_N * fcf_margin * (1.0 + terminal_growth)
-    tv = fcf_term / (wacc - terminal_growth) if wacc > terminal_growth else 0.0
+    rows = []
+    rev = base_revenue
+    pv_ex = 0.0
+    for t in range(1, years + 1):
+        rev = rev * (1.0 + revenue_growth)
+        fcff = rev * operating_margin * (1.0 - tax_rate) - rev * capex_pct
+        df = (1.0 + wacc) ** t
+        pv = fcff / df
+        pv_ex += pv
+        rows.append({"Year": t, "Revenue": rev, "FCFF": fcff, "PV_FCFF": pv})
+
+    proj = pd.DataFrame(rows).set_index("Year")
+
+    # Terminal value on the last-period FCFF
+    last_fcff = float(proj["FCFF"].iloc[-1])
+    tv = last_fcff * (1.0 + term_g) / (wacc - term_g)
     pv_tv = tv / (1.0 + wacc) ** years
 
-    enterprise_value = pv_total + pv_tv
-    equity = enterprise_value - net_debt
-    per_share = (equity / shares_out) if (shares_out and shares_out > 0) else None
-    mos = ((per_share - current_price) / current_price) if (per_share and current_price) else None
+    ev = pv_ex + pv_tv
+    equity = ev - net_debt
 
-    df = pd.DataFrame(rows).set_index("Year")
+    per_share: float | None = None
+    if shares_out and shares_out > 0 and np.isfinite(equity):
+        per_share = equity / shares_out
+
+    mos: float | None = None
+    if per_share is not None and current_price and current_price > 0:
+        mos = (per_share - current_price) / current_price
+
+    tv_pct = pv_tv / ev if ev > 0 else 0.0
+
     return IntrinsicResult(
         intrinsic_equity=equity,
         intrinsic_per_share=per_share,
         margin_of_safety=mos,
-        projections=df,
+        projections=proj,
+        enterprise_value=ev,
+        pv_explicit=pv_ex,
+        pv_terminal=pv_tv,
+        tv_pct=tv_pct,
     )
 
 

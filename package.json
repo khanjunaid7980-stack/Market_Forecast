@@ -1,0 +1,11 @@
+{
+  "name": "rvm-forecast",
+  "private": true,
+  "workspaces": ["server", "web"],
+  "scripts": {
+    "dev:server": "npm --workspace server run dev",
+    "dev:web": "npm --workspace web run dev",
+    "dev": "npm run dev:server & npm run dev:web",
+    "build": "npm --workspace server run build && npm --workspace web run build"
+  }
+}
